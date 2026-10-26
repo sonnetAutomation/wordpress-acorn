@@ -7,15 +7,19 @@ use Illuminate\Bus\UniqueLock;
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Contracts\Cache\Repository as Cache;
+use Illuminate\Contracts\Queue\PreparesForDispatch;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Foundation\Queue\InteractsWithUniqueJobs;
 use Illuminate\Queue\Attributes\DebounceFor;
+use Illuminate\Queue\Attributes\ReadsQueueAttributes;
+use Illuminate\Queue\Events\UniqueJobSkipped;
+use Illuminate\Support\Traits\Conditionable;
 use LogicException;
-use ReflectionClass;
+use Throwable;
 
 class PendingDispatch
 {
-    use InteractsWithUniqueJobs;
+    use Conditionable, InteractsWithUniqueJobs, ReadsQueueAttributes;
 
     /**
      * The job.
@@ -205,12 +209,27 @@ class PendingDispatch
      */
     protected function shouldDispatch()
     {
+        if ($this->job instanceof PreparesForDispatch && $this->job->prepareForDispatch() === false) {
+            return false;
+        }
+
         if (! $this->job instanceof ShouldBeUnique) {
             return true;
         }
 
-        return (new UniqueLock(Container::getInstance()->make(Cache::class)))
-            ->acquire($this->job);
+        $container = Container::getInstance();
+
+        $lockAcquired = (new UniqueLock($container->make(Cache::class)))->acquire($this->job);
+
+        if ($lockAcquired) {
+            return true;
+        }
+
+        if ($container->bound('events')) {
+            $container->make('events')->dispatch(new UniqueJobSkipped($this->job));
+        }
+
+        return false;
     }
 
     /**
@@ -218,22 +237,24 @@ class PendingDispatch
      *
      * @return void
      *
-     * @throws \LogicException
+     * @throws LogicException
      */
     protected function acquireDebounceLock()
     {
-        if (empty((new ReflectionClass($this->job))->getAttributes(DebounceFor::class))) {
+        $debounceFor = $this->getAttributeValue($this->job, DebounceFor::class, 'debounceFor');
+
+        if ($debounceFor === null) {
             return;
         }
+
+        $lock = new DebounceLock(Container::getInstance()->make(Cache::class));
 
         if ($this->job instanceof ShouldBeUnique) {
             throw new LogicException('A debounced job cannot also implement ShouldBeUnique.');
         }
 
-        $lock = new DebounceLock(Container::getInstance()->make(Cache::class));
-
         $result = $lock->acquire(
-            $this->job, $debounceFor = $lock->getDebounceDelay($this->job)
+            $this->job, $debounceFor
         );
 
         $this->job->debounceOwner = $result['owner'];
@@ -274,22 +295,28 @@ class PendingDispatch
      */
     public function __destruct()
     {
-        $this->addUniqueJobInformationToContext($this->job);
-
         if (! $this->shouldDispatch()) {
-            $this->removeUniqueJobInformationFromContext($this->job);
-
             return;
         }
 
-        $this->acquireDebounceLock();
+        $this->addUniqueJobInformationToContext($this->job);
 
-        if ($this->afterResponse) {
-            app(Dispatcher::class)->dispatchAfterResponse($this->job);
-        } else {
-            app(Dispatcher::class)->dispatch($this->job);
+        try {
+            $this->acquireDebounceLock();
+
+            if ($this->afterResponse) {
+                app(Dispatcher::class)->dispatchAfterResponse($this->job);
+            } else {
+                app(Dispatcher::class)->dispatch($this->job);
+            }
+        } catch (Throwable $e) {
+            if ($this->job instanceof ShouldBeUnique) {
+                (new UniqueLock(Container::getInstance()->make(Cache::class)))->release($this->job);
+            }
+
+            throw $e;
+        } finally {
+            $this->removeUniqueJobInformationFromContext($this->job);
         }
-
-        $this->removeUniqueJobInformationFromContext($this->job);
     }
 }
